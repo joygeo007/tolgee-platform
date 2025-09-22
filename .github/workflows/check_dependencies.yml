@@ -1,0 +1,130 @@
+name: Check Dependencies on Issue Close
+
+on:
+  issues:
+    types: [closed]
+
+jobs:
+  check-and-reopen:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write      # To reopen issues and comment
+      projects: read     # To read dependency data from project fields
+      contents: read     # To access github-script
+
+    steps:
+      - name: Check for open dependencies
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // --- ⚙️ CONFIGURATION ---
+            // ❗ Change these two values to match your project setup.
+
+            // The number of the GitHub Project to check.
+            const PROJECT_NUMBER = 3; 
+            // The exact name of the custom text field in your project for dependencies.
+            const DEPENDENCY_FIELD_NAME = 'Dependencies';
+
+            // --- Workflow Script (No changes needed below) ---
+            const issue = github.context.payload.issue;
+            const owner = github.context.repo.owner;
+            const repo = github.context.repo.repo;
+            
+            console.log(`Checking dependencies for closed issue #${issue.number}...`);
+
+            // 1. GraphQL query to find the dependency string from the project item.
+            const query = `
+              query($issueNodeId: ID!, $projectNumber: Int!) {
+                node(id: $issueNodeId) {
+                  ... on Issue {
+                    projectItems(first: 10) {
+                      nodes {
+                        project {
+                          number
+                        }
+                        fieldValueByName(name: "${DEPENDENCY_FIELD_NAME}") {
+                          ... on ProjectV2ItemFieldTextValue {
+                            text
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            const variables = {
+              issueNodeId: issue.node_id,
+              projectNumber: PROJECT_NUMBER
+            };
+
+            const result = await github.graphql(query, variables);
+
+            const projectItem = result.node.projectItems.nodes.find(item => item.project.number === PROJECT_NUMBER);
+
+            if (!projectItem) {
+              console.log(`Issue #${issue.number} is not in Project #${PROJECT_NUMBER}. Skipping.`);
+              return;
+            }
+
+            const dependencyText = projectItem.fieldValueByName?.text;
+
+            if (!dependencyText) {
+              console.log(`No dependencies found in the '${DEPENDENCY_FIELD_NAME}' field for issue #${issue.number}.`);
+              return;
+            }
+            
+            // 2. Parse the dependency string. Handles formats like #123 and owner/repo#123.
+            const dependencyRegex = /(?:(?<owner>[\w.-]+)\/(?<repo>[\w.-]+))?#(?<issueNumber>\d+)/g;
+            const matches = [...dependencyText.matchAll(dependencyRegex)];
+
+            if (matches.length === 0) {
+              console.log(`Could not parse any issue numbers from dependency string: "${dependencyText}"`);
+              return;
+            }
+
+            const openDependencies = [];
+
+            // 3. Check the status of each dependency issue.
+            for (const match of matches) {
+              const depOwner = match.groups.owner || owner;
+              const depRepo = match.groups.repo || repo;
+              const depNumber = parseInt(match.groups.issueNumber, 10);
+
+              try {
+                const { data: dependencyIssue } = await github.rest.issues.get({
+                  owner: depOwner,
+                  repo: depRepo,
+                  issue_number: depNumber,
+                });
+
+                if (dependencyIssue.state === 'open') {
+                  openDependencies.push(`${depOwner}/${depRepo}#${depNumber}`);
+                }
+              } catch (error) {
+                console.error(`Could not fetch issue ${depOwner}/${depRepo}#${depNumber}. It might not exist or permissions are missing. Error: ${error.message}`);
+              }
+            }
+
+            // 4. If any dependencies are open, reopen the original issue and add a comment.
+            if (openDependencies.length > 0) {
+              const commentBody = `Reopening this issue because the following dependencies are still open:\n- ${openDependencies.join('\n- ')}`;
+
+              await github.rest.issues.update({
+                owner: owner,
+                repo: repo,
+                issue_number: issue.number,
+                state: 'open',
+              });
+
+              await github.rest.issues.createComment({
+                owner: owner,
+                repo: repo,
+                issue_number: issue.number,
+                body: commentBody,
+              });
+
+              console.log(`Reopened issue #${issue.number} due to open dependencies: ${openDependencies.join(', ')}`);
+            } else {
+              console.log(`All dependencies for issue #${issue.number} are closed. No action needed.`);
+            }
